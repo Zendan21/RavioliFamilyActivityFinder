@@ -1,4 +1,4 @@
-RAVIOLI FAMILY ACTIVITY FINDER 1.0.5
+RAVIOLI FAMILY ACTIVITY FINDER 1.0.7
 
 A community group finder for Project Ebonhold (WoW 3.3.5a). Players with the
 addon can discover shared listings, request invitations, and manage applicants.
@@ -25,6 +25,7 @@ FEATURES
 - Sender identity embedded in each packet to survive server-side chat-name rewriting.
 - Unique per-login session identity for reliable self-versus-Ravioli detection.
 - Immediate Ravioli registration at the transport layer before payload reassembly.
+- Fast login discovery through staggered, rate-limited presence replies from existing Ravioli users.
 - Character-deduplicated Ravioli counts and compact session tokens for smaller packets.
 - Paced channel send queue to prevent heartbeat and listing packets being flood-dropped.
 - Compact single-packet listing advertisements with optional metadata sent separately.
@@ -42,6 +43,8 @@ FEATURES
 - An active listing closes immediately if its owner joins another leader's group.
 - Optional automatic invitations and automatic closing when full.
 - Smart automatic error whispers distinguish HC mismatches, already-grouped applicants, full groups, and other failures.
+- Optional new-listing watch for All Activities, Raids, Group Quests, Open World, or Custom.
+- Listing-watch notifications pause automatically while the player is already in a party or raid.
 - The custom automatic whisper message is used specifically for HC mode mismatches.
 - Custom whispers support `{applicant_mode}`, `{group_mode}`, and `{error}` tokens.
 - The concise default HC failure reply is: `Please go to {group_mode} to join.`

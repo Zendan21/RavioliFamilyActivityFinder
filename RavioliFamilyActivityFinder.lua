@@ -1,6 +1,6 @@
 local addonName = ...
 
-local VERSION = "1.0.5"
+local VERSION = "1.0.7"
 local PREFIX = "|cffd9a441Ravioli Finder:|r "
 local WIRE_PREFIX = "[EAF2]"
 local CHAT_WIRE_PREFIX = "EAF4:"
@@ -17,6 +17,7 @@ local HEARTBEAT_SECONDS = 30 * 60
 local REMOTE_TIMEOUT_SECONDS = 35 * 60
 local PEER_TIMEOUT_SECONDS = 35 * 60
 local MANUAL_REFRESH_COOLDOWN_SECONDS = 60
+local PRESENCE_REPLY_COOLDOWN_SECONDS = 10
 local APPLICATION_COOLDOWN_SECONDS = 2 * 60
 local INACTIVE_REMOVAL_SECONDS = 60 * 60
 local EXPIRY_VALUES = { 5, 10, 15, 20, 25, 30 }
@@ -82,6 +83,8 @@ local runtime = {
     lastManualRefreshAt = 0,
     lastRefreshResponseAt = 0,
     pendingRefreshBroadcastAt = nil,
+    pendingPresenceResponseAt = nil,
+    lastPresenceResponseAt = 0,
     outboundQueue = {},
     outboundCooldown = 0,
     outboundMessagesSent = 0,
@@ -118,7 +121,7 @@ local defaultSettings = {
     autoWhisperInviteErrors = true,
     inviteFailureWhisper = "Please go to {group_mode} to join.",
     notifications = true,
-    notifyListings = false,
+    listingWatchCategory = "OFF",
     sounds = true,
     expiryMinutes = 15,
     showLauncher = true,
@@ -548,6 +551,32 @@ local function Notify(message, sound)
     if not RavioliFamilyActivityFinderDB or not RavioliFamilyActivityFinderDB.settings.notifications then return end
     Print(message)
     if sound and RavioliFamilyActivityFinderDB.settings.sounds and PlaySound then PlaySound("TellMessage") end
+end
+
+local function NormalizeListingWatchCategory(value)
+    value = tostring(value or "OFF"):upper()
+    if value == "ALL" or value == "RAID" or value == "QUEST"
+        or value == "WORLD" or value == "CUSTOM" then
+        return value
+    end
+    return "OFF"
+end
+
+local function GetListingWatchName(value)
+    value = NormalizeListingWatchCategory(value)
+    if value == "OFF" then return "Off" end
+    if value == "ALL" then return "All Activities" end
+    local category = categoryByKey[value]
+    return category and category.name or "Off"
+end
+
+local function ShouldNotifyAboutListing(listing)
+    if not listing or IsLocalPlayerName(listing.owner) then return false end
+    if (listing.status or "OPEN") ~= "OPEN" then return false end
+    if GetCurrentGroupSize() > 1 then return false end
+    local watched = NormalizeListingWatchCategory(
+        RavioliFamilyActivityFinderDB.settings.listingWatchCategory)
+    return watched == "ALL" or watched == listing.category
 end
 
 local function GetListingsSource()
@@ -2038,10 +2067,9 @@ local function ProcessWirePayload(payload, sender, transportSession)
         }
         runtime.remoteListings[key] = remoteListing
         runtime.importedListingPackets = runtime.importedListingPackets + 1
-        local matchesCurrentView = (state.category == "ALL" or remoteListing.category == state.category)
-            and MatchesSearch(remoteListing, Trim(state.search):lower())
-        if isNew and matchesCurrentView and RavioliFamilyActivityFinderDB.settings.notifyListings and remoteListing.status == "OPEN" then
-            Notify("New " .. GetCategoryShortName(remoteListing.category) .. " listing: " .. remoteListing.title, true)
+        if isNew and ShouldNotifyAboutListing(remoteListing) then
+            Notify("New " .. GetCategoryShortName(remoteListing.category) .. " listing from "
+                .. (remoteListing.owner or "Unknown") .. ": " .. remoteListing.title, true)
         end
         UpdateListings()
     elseif command == "M" then
@@ -2122,11 +2150,24 @@ HandleChannelMessage = function(message, sender, channelString, channelNumber, c
         if #fields < 2 then return end
         local cleanSender = SanitizePlayerName(fields[1])
         local transportSession = fields[2]
+        local presenceKind = fields[3] or ""
         ObserveTransportGameMode(cleanMessage, presenceMarker, cleanSender, transportSession)
         if transportSession == "" or transportSession == GetSessionID() then return end
         runtime.peers[cleanSender:lower()] = time()
         runtime.lastReceivedAt = time()
         UpdateConnectionStatus()
+        if presenceKind == "H" then
+            local now = GetTime and GetTime() or time()
+            local replyAt = now + (math.random(2, 25) / 10)
+            if runtime.lastPresenceResponseAt > 0 then
+                local cooldownEnds = runtime.lastPresenceResponseAt + PRESENCE_REPLY_COOLDOWN_SECONDS
+                if replyAt < cooldownEnds then replyAt = cooldownEnds end
+            end
+            if not runtime.pendingPresenceResponseAt
+                or replyAt < runtime.pendingPresenceResponseAt then
+                runtime.pendingPresenceResponseAt = replyAt
+            end
+        end
         return
     end
 
@@ -2317,10 +2358,9 @@ HandleChannelMessage = function(message, sender, channelString, channelNumber, c
         }
         runtime.remoteListings[key] = remoteListing
         runtime.importedListingPackets = runtime.importedListingPackets + 1
-        local matchesCurrentView = (state.category == "ALL" or remoteListing.category == state.category)
-            and MatchesSearch(remoteListing, Trim(state.search):lower())
-        if isNew and matchesCurrentView and RavioliFamilyActivityFinderDB.settings.notifyListings then
-            Notify("New " .. GetCategoryShortName(remoteListing.category) .. " listing: " .. remoteListing.title, true)
+        if isNew and ShouldNotifyAboutListing(remoteListing) then
+            Notify("New " .. GetCategoryShortName(remoteListing.category) .. " listing from "
+                .. (remoteListing.owner or "Unknown") .. ": " .. remoteListing.title, true)
         end
         UpdateListings()
         return
@@ -2418,7 +2458,7 @@ EnsureChannel = function()
             ChatFrame_AddChannel(DEFAULT_CHAT_FRAME, CHANNEL_NAME)
         end
         if not wasConnected then
-            QueueDirectAction(PRESENCE_WIRE_PREFIX)
+            QueueDirectAction(PRESENCE_WIRE_PREFIX, { "H" })
             QueueDirectAction(REFRESH_WIRE_PREFIX)
         end
     end
@@ -2559,6 +2599,49 @@ local function CreateSettingToggle(parent, label, key, y, callback)
     return button
 end
 
+local function CreateListingWatchDropdown(parent)
+    local values = { "OFF", "ALL", "RAID", "QUEST", "WORLD", "CUSTOM" }
+    local dropdown = CreateButton(parent, "Off", 360, 28)
+
+    dropdown.arrow = CreateText(dropdown, "v", 11, COLORS.gold, "CENTER")
+    dropdown.arrow:SetPoint("RIGHT", -10, 0)
+    dropdown.arrow:SetWidth(14)
+
+    dropdown.menu = CreateFrame("Frame", nil, parent)
+    dropdown.menu:SetPoint("TOPLEFT", dropdown, "BOTTOMLEFT", 0, -2)
+    dropdown.menu:SetWidth(360)
+    dropdown.menu:SetHeight((#values * 28) + 4)
+    dropdown.menu:SetFrameLevel(parent:GetFrameLevel() + 30)
+    AddBackground(dropdown.menu, COLORS.panel, COLORS.gold)
+    dropdown.menu:Hide()
+
+    for index, key in ipairs(values) do
+        local option = CreateFrame("Button", nil, dropdown.menu)
+        option:SetPoint("TOPLEFT", 2, -2 - ((index - 1) * 28))
+        option:SetWidth(356)
+        option:SetHeight(28)
+        option.value = key
+        option.highlight = option:CreateTexture(nil, "BACKGROUND")
+        option.highlight:SetAllPoints()
+        SetColor(option.highlight, { 0.14, 0.16, 0.20, 1 })
+        option.highlight:Hide()
+        option.label = CreateText(option, GetListingWatchName(key), 11, COLORS.text)
+        option.label:SetPoint("LEFT", 10, 0)
+        option:SetScript("OnEnter", function(self) self.highlight:Show() end)
+        option:SetScript("OnLeave", function(self) self.highlight:Hide() end)
+        option:SetScript("OnClick", function(self)
+            RavioliFamilyActivityFinderDB.settings.listingWatchCategory = self.value
+            dropdown.label:SetText(GetListingWatchName(self.value))
+            dropdown.menu:Hide()
+        end)
+    end
+
+    dropdown:SetScript("OnClick", function(self)
+        if self.menu:IsShown() then self.menu:Hide() else self.menu:Show() end
+    end)
+    return dropdown
+end
+
 local function BuildSettingsFrame()
     settingsFrame = CreateFrame("Frame", "RavioliFamilyActivityFinderSettingsFrame", UIParent)
     settingsFrame:SetWidth(400)
@@ -2626,18 +2709,21 @@ local function BuildSettingsFrame()
         RefreshWhisperMessageEditor()
     end)
     AddToggle("Show finder notifications", "notifications", -270)
-    AddToggle("Notify me about newly discovered listings", "notifyListings", -304)
-    AddToggle("Play notification sounds", "sounds", -338)
-    AddToggle("Show the floating finder button", "showLauncher", -372, function() RefreshLauncher() end)
-    AddToggle("Lock the floating finder button", "lockLauncher", -406, function() RefreshLauncher() end)
-    AddToggle("Keep the Ravioli Finder and Quest Log synchronized", "linkQuestLog", -440, function(enabled)
+    local watchLabel = CreateText(settingsFrame, "NOTIFY ME ABOUT NEW LISTINGS", 9, COLORS.muted)
+    watchLabel:SetPoint("TOPLEFT", 20, -307)
+    settingsFrame.listingWatch = CreateListingWatchDropdown(settingsFrame)
+    settingsFrame.listingWatch:SetPoint("TOPLEFT", 20, -320)
+    AddToggle("Play notification sounds", "sounds", -360)
+    AddToggle("Show the floating finder button", "showLauncher", -394, function() RefreshLauncher() end)
+    AddToggle("Lock the floating finder button", "lockLauncher", -428, function() RefreshLauncher() end)
+    AddToggle("Keep the Ravioli Finder and Quest Log synchronized", "linkQuestLog", -462, function(enabled)
         if enabled and mainFrame and mainFrame:IsShown() then ShowLinkedQuestLog() end
     end)
 
     local expiryLabel = CreateText(settingsFrame, "AUTO-EXPIRE MY LISTING", 9, COLORS.muted)
-    expiryLabel:SetPoint("TOPLEFT", 20, -480)
+    expiryLabel:SetPoint("TOPLEFT", 20, -510)
     settingsFrame.expiry = CreateButton(settingsFrame, "15 minutes", 360, 28)
-    settingsFrame.expiry:SetPoint("TOPLEFT", 20, -495)
+    settingsFrame.expiry:SetPoint("TOPLEFT", 20, -525)
     settingsFrame.expiry:SetScript("OnClick", function(self)
         local current = NormalizeExpiryMinutes(RavioliFamilyActivityFinderDB.settings.expiryMinutes)
         local nextValue = EXPIRY_VALUES[1]
@@ -2665,9 +2751,16 @@ local function BuildSettingsFrame()
         for _, toggle in ipairs(self.toggles) do toggle:Refresh() end
         self.whisperMessageInput:SetText(RavioliFamilyActivityFinderDB.settings.inviteFailureWhisper or "")
         RefreshWhisperMessageEditor()
+        local watched = NormalizeListingWatchCategory(
+            RavioliFamilyActivityFinderDB.settings.listingWatchCategory)
+        RavioliFamilyActivityFinderDB.settings.listingWatchCategory = watched
+        self.listingWatch.label:SetText(GetListingWatchName(watched))
         local expiry = NormalizeExpiryMinutes(RavioliFamilyActivityFinderDB.settings.expiryMinutes)
         RavioliFamilyActivityFinderDB.settings.expiryMinutes = expiry
         self.expiry.label:SetText(expiry .. " minutes")
+    end)
+    settingsFrame:SetScript("OnHide", function(self)
+        if self.listingWatch and self.listingWatch.menu then self.listingWatch.menu:Hide() end
     end)
 end
 
@@ -2854,6 +2947,11 @@ eventFrame:SetScript("OnUpdate", function(_, elapsed)
     if not initialized then return end
     CompletePendingInvites()
     local preciseNow = GetTime and GetTime() or time()
+    if runtime.pendingPresenceResponseAt and preciseNow >= runtime.pendingPresenceResponseAt then
+        runtime.pendingPresenceResponseAt = nil
+        runtime.lastPresenceResponseAt = preciseNow
+        QueueDirectAction(PRESENCE_WIRE_PREFIX, { "R" })
+    end
     if runtime.pendingRefreshBroadcastAt and preciseNow >= runtime.pendingRefreshBroadcastAt then
         runtime.pendingRefreshBroadcastAt = nil
         runtime.lastRefreshResponseAt = preciseNow
@@ -2925,9 +3023,16 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         if type(RavioliFamilyActivityFinderDB.settings) ~= "table" then RavioliFamilyActivityFinderDB.settings = {} end
         -- Ignore-list support was removed in 0.4.5; clear legacy saved entries.
         RavioliFamilyActivityFinderDB.blocked = nil
+        local legacyNotifyListings = RavioliFamilyActivityFinderDB.settings.notifyListings
         for key, value in pairs(defaultSettings) do
             if RavioliFamilyActivityFinderDB.settings[key] == nil then RavioliFamilyActivityFinderDB.settings[key] = value end
         end
+        if legacyNotifyListings ~= nil then
+            RavioliFamilyActivityFinderDB.settings.listingWatchCategory = legacyNotifyListings and "ALL" or "OFF"
+            RavioliFamilyActivityFinderDB.settings.notifyListings = nil
+        end
+        RavioliFamilyActivityFinderDB.settings.listingWatchCategory = NormalizeListingWatchCategory(
+            RavioliFamilyActivityFinderDB.settings.listingWatchCategory)
         if RavioliFamilyActivityFinderDB.settings.inviteFailureWhisper
                 == "Sorry, I couldn't invite you because: {error}"
             or RavioliFamilyActivityFinderDB.settings.inviteFailureWhisper
